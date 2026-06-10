@@ -94,6 +94,7 @@ CVAR_DEFINE_AUTO( net_showpackets, "0", FCVAR_PRIVILEGED, "show network packets"
 static CVAR_DEFINE_AUTO( net_chokeloop, "0", 0, "apply bandwidth choke to loopback packets" );
 static CVAR_DEFINE_AUTO( net_showdrop, "0", 0, "show packets that are dropped" );
 static CVAR_DEFINE_AUTO( net_qport, "0", FCVAR_READ_ONLY, "current quake netport" );
+static CVAR_DEFINE_AUTO( net_sequence_window, "256", 0, "reject sequenced packets that jump more than this many sequences ahead (anti-spoofing; 0 disables)" );
 CVAR_DEFINE_AUTO( net_send_debug, "0", FCVAR_PRIVILEGED, "enable debugging output for outgoing messages" );
 CVAR_DEFINE_AUTO( net_recv_debug, "0", FCVAR_PRIVILEGED, "enable debugging output for incoming messages" );
 
@@ -173,6 +174,7 @@ void Netchan_Init( void )
 	Cvar_RegisterVariable( &net_chokeloop );
 	Cvar_RegisterVariable( &net_showdrop );
 	Cvar_RegisterVariable( &net_qport );
+	Cvar_RegisterVariable( &net_sequence_window );
 	Cvar_RegisterVariable( &net_send_debug );
 	Cvar_RegisterVariable( &net_recv_debug );
 	Cvar_FullSet( net_qport.name, buf, net_qport.flags );
@@ -239,7 +241,16 @@ void Netchan_Setup( netsrc_t sock, netchan_t *chan, netadr_t adr, int qport, voi
 	chan->last_received = host.realtime;
 	chan->connect_time = host.realtime;
 	chan->incoming_sequence = 0;
-	chan->outgoing_sequence = 1;
+
+	// the server picks a random initial outgoing sequence so a remote attacker can't guess where in the sequence space the channel is
+	// kept well below BIT( 30 ) — bits 30/31 are reserved for the flags
+	// FIXME: BIT( 27 ) taken so in the worst case we have few months of stable client<->server connection
+	// as netchan doesn't currently handle wrapping around
+	if( sock == NS_SERVER )
+		chan->outgoing_sequence = COM_RandomLong( 1, BIT( 27 ) - 1 );
+	else
+		chan->outgoing_sequence = 1;
+
 	chan->rate = DEFAULT_RATE;
 	chan->qport = qport;
 	chan->client = client;
@@ -248,8 +259,22 @@ void Netchan_Setup( netsrc_t sock, netchan_t *chan, netadr_t adr, int qport, voi
 	chan->use_bz2 = FBitSet( flags, NETCHAN_USE_BZIP2 ) ? true : false;
 	chan->use_lzss = FBitSet( flags, NETCHAN_USE_LZSS ) ? true : false;
 	chan->gs_netchan = FBitSet( flags, NETCHAN_GOLDSRC ) ? true : false;
+	chan->use_cookie = FBitSet( flags, NETCHAN_USE_COOKIE ) ? true : false;
+	chan->cookie = 0;
 
 	MSG_Init( &chan->message, "NetData", chan->message_buf, sizeof( chan->message_buf ));
+}
+
+/*
+==============
+Netchan_SetCookie
+
+called on the client after parsing NET_EXT_NETCHAN_COOKIE in the connect reply
+==============
+*/
+void Netchan_SetCookie( netchan_t *chan, uint64_t cookie )
+{
+	chan->cookie = cookie;
 }
 
 /*
@@ -984,6 +1009,17 @@ int Netchan_CreateFileFragments( netchan_t *chan, const char *filename )
 		Mem_Free( uncompressed );
 	}
 
+	// filename string + null terminator; for gs_netchan also compressor string + null + uint32 original size
+	int header_size = Q_strlen( filename ) + 1;
+	if( chan->gs_netchan )
+		header_size += Q_strlen( compressor ) + 1 + 4;
+
+	if( unlikely( chunksize < 0 || chunksize < header_size + 1 ))
+	{
+		Con_Printf( S_ERROR "%s: could not fit header for \"%s\" (%d bytes) into chunk of length %d\n", NET_AdrToString( chan->remote_address ), filename, header_size, chunksize );
+		return 0;
+	}
+
 	fragbufwaiting_t *wait = (fragbufwaiting_t *)Mem_Calloc( net_mempool, sizeof( fragbufwaiting_t ));
 	int remaining = filesize;
 	int pos = 0;
@@ -991,6 +1027,9 @@ int Netchan_CreateFileFragments( netchan_t *chan, const char *filename )
 	while( remaining > 0 )
 	{
 		int send = Q_min( remaining, chunksize );
+
+		if( firstfragment )
+			send = Q_min( header_size + remaining, chunksize );
 
 		buf = Netchan_AllocFragbuf( send );
 		buf->bufferid = bufferid++;
@@ -1000,7 +1039,7 @@ int Netchan_CreateFileFragments( netchan_t *chan, const char *filename )
 
 		if( firstfragment )
 		{
-			// Write filename
+			// write filename
 			MSG_WriteString( &buf->frag_message, filename );
 
 			// write compressor name and uncompressed size
@@ -1010,9 +1049,11 @@ int Netchan_CreateFileFragments( netchan_t *chan, const char *filename )
 				MSG_WriteLong( &buf->frag_message, (uint)originalSize );
 			}
 
-			// Send a bit less on first package
-			send -= MSG_GetNumBytesWritten( &buf->frag_message );
+			if( unlikely( MSG_GetNumBytesWritten( &buf->frag_message ) != header_size ))
+				Con_Printf( S_ERROR "%s: header size mismatch for \"%s\" (%d vs %d)\n", NET_AdrToString( chan->remote_address ), filename, header_size, MSG_GetNumBytesWritten( &buf->frag_message ));
 
+			// send a bit less on first package
+			send -= MSG_GetNumBytesWritten( &buf->frag_message );
 			firstfragment = false;
 		}
 
@@ -1264,6 +1305,10 @@ qboolean Netchan_CopyFileFragments( netchan_t *chan, sizebuf_t *msg )
 		p = n;
 	}
 
+	// buffers consumed, now reset incomingbufs
+	chan->incomingbufs[FRAG_FILE_STREAM] = NULL;
+	chan->incomingready[FRAG_FILE_STREAM] = false;
+
 	if( chan->gs_netchan && chan->use_bz2 && !Q_stricmp( compressor, "bz2" ))
 	{
 #if !XASH_DEDICATED
@@ -1271,7 +1316,6 @@ qboolean Netchan_CopyFileFragments( netchan_t *chan, sizebuf_t *msg )
 		{
 			Con_Printf( S_ERROR "BZ2 fragment uncompressed size out of range: %u for %s\n", uncompressedSize, filename );
 			Mem_Free( buffer );
-			Netchan_FlushIncoming( chan, FRAG_FILE_STREAM );
 			return false;
 		}
 
@@ -1283,7 +1327,6 @@ qboolean Netchan_CopyFileFragments( netchan_t *chan, sizebuf_t *msg )
 			Con_DPrintf( S_ERROR "BZ2 decompression failed for %s\n", filename );
 			Mem_Free( buffer );
 			Mem_Free( uncompressedBuffer );
-			Netchan_FlushIncoming( chan, FRAG_FILE_STREAM );
 			return false;
 		}
 		Mem_Free( buffer );
@@ -1301,7 +1344,6 @@ qboolean Netchan_CopyFileFragments( netchan_t *chan, sizebuf_t *msg )
 		{
 			Con_Printf( S_ERROR "LZSS fragment uncompressed size out of range: %u for %s\n", uncompressedSize, filename );
 			Mem_Free( buffer );
-			Netchan_FlushIncoming( chan, FRAG_FILE_STREAM );
 			return false;
 		}
 
@@ -1330,9 +1372,6 @@ qboolean Netchan_CopyFileFragments( netchan_t *chan, sizebuf_t *msg )
 
 	// clear remnants
 	MSG_Clear( msg );
-
-	chan->incomingbufs[FRAG_FILE_STREAM] = NULL;
-	chan->incomingready[FRAG_FILE_STREAM] = false;
 
 	return true;
 }
@@ -1662,6 +1701,14 @@ void Netchan_TransmitBits( netchan_t *chan, int length, const byte *data )
 
 	chan->outgoing_sequence++;
 
+	// prefix the cookie so the peer can authenticate this packet as ours
+	// before doing anything else with it
+	if( chan->use_cookie )
+	{
+		MSG_WriteLong( &send, (uint)( chan->cookie & 0xFFFFFFFF ));
+		MSG_WriteLong( &send, (uint)( chan->cookie >> 32 ));
+	}
+
 	MSG_WriteLong( &send, w1 );
 	MSG_WriteLong( &send, w2 );
 
@@ -1786,15 +1833,42 @@ qboolean Netchan_Process( netchan_t *chan, sizebuf_t *msg )
 
 	// get sequence numbers
 	MSG_Clear( msg );
+
+	// authenticate via the per-connection cookie before parsing anything else;
+	// a spoofed packet from a remote attacker won't know the 64-bit cookie and
+	// will be rejected here without touching sequence/ack state
+	if( chan->use_cookie )
+	{
+		if( MSG_GetMaxBytes( msg ) < 16 )
+		{
+			Con_Reportf( S_WARN "%s: %s: truncated packet (%d bytes) with cookie expected, dropping\n", __func__, NET_AdrToString( chan->remote_address ), MSG_GetMaxBytes( msg ));
+			return false;
+		}
+
+		uint32_t cookie_lo = MSG_ReadDword( msg );
+		uint32_t cookie_hi = MSG_ReadDword( msg );
+		uint64_t cookie = ((uint64_t)cookie_hi << 32 ) | (uint64_t)cookie_lo;
+
+		if( cookie != chan->cookie )
+		{
+			Con_Reportf( S_WARN "%s: %s: cookie mismatch, dropping (possible spoof attempt)\n", __func__, NET_AdrToString( chan->remote_address ));
+			return false;
+		}
+	}
+
 	uint sequence = MSG_ReadLong( msg );
 	uint sequence_ack = MSG_ReadLong( msg );
 
 	if( chan->use_munge && MSG_GetMaxBytes( msg ) >= 8 )
 		COM_UnMunge2( msg->pData + 8, MSG_GetMaxBytes( msg ) - 8, sequence & 0xFF );
 
-	// read the qport if we are a server
+	// read the qport if we are a server; serves as a NAT-stable
+	// connection demultiplexer and rejects packets for the wrong client
 	if( chan->sock == NS_SERVER )
-		MSG_ReadShort( msg );
+	{
+		if(( MSG_ReadShort( msg ) & 0xffff ) != chan->qport )
+			return false;
+	}
 
 	uint reliable_message = sequence >> 31;
 	uint reliable_ack = sequence_ack >> 31;
@@ -1853,6 +1927,20 @@ qboolean Netchan_Process( netchan_t *chan, sizebuf_t *msg )
 				Con_Printf( "%s:duplicate packet %i at %i\n", adr, sequence, chan->incoming_sequence );
 			else Con_Printf( "%s:out of order packet %i at %i\n", adr, sequence, chan->incoming_sequence );
 		}
+		return false;
+	}
+
+	// reject packets that leap too far ahead of the expected sequence
+	// skip on the very first packet — the server starts with a random
+	// outgoing_sequence, so the first one legitimately jumps far ahead of 0
+	// NOTE: disable sequence window with cookie extension, if cookie ext proves
+	// to be inefficient, we can safely enable sequence window back
+	if( !chan->use_cookie && chan->incoming_sequence != 0 && net_sequence_window.value > 0 && sequence > chan->incoming_sequence + (uint)net_sequence_window.value )
+	{
+		Con_Printf( S_WARN "%s: %s: sequence %u jumps %u ahead of expected %i (window %i), dropping\n",
+			__func__, NET_AdrToString( chan->remote_address ),
+			sequence, sequence - chan->incoming_sequence,
+			chan->incoming_sequence, (int)net_sequence_window.value );
 		return false;
 	}
 

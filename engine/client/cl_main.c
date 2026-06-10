@@ -13,6 +13,7 @@ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
 */
 
+#include <inttypes.h>
 #include "common.h"
 #include "client.h"
 #include "net_encode.h"
@@ -38,6 +39,7 @@ CVAR_DEFINE_AUTO( cl_download_ingame, "1", FCVAR_ARCHIVE, "allow to downloading 
 static CVAR_DEFINE_AUTO( cl_logofile, "lambda", FCVAR_ARCHIVE, "player logo name" );
 static CVAR_DEFINE_AUTO( cl_logocolor, "255 120 24", FCVAR_ARCHIVE, "player logo color" );
 static CVAR_DEFINE_AUTO( cl_logoext, "bmp", FCVAR_ARCHIVE, "temporary cvar to tell engine which logo must be packed" );
+static CVAR_DEFINE( cl_logoupdate, "@cl_logoupdate", "0", 0, "set by menu to trigger clan logo update" );
 CVAR_DEFINE_AUTO( cl_logomaxdim, "96", FCVAR_ARCHIVE, "maximum decal dimension" );
 static CVAR_DEFINE_AUTO( cl_test_bandwidth, "1", FCVAR_ARCHIVE, "test network bandwith before connection" );
 
@@ -47,18 +49,18 @@ CVAR_DEFINE( cl_draw_beams, "r_drawbeams", "1", FCVAR_CHEAT, "render beams" );
 
 static CVAR_DEFINE_AUTO( rcon_address, "", FCVAR_PRIVILEGED, "remote control address" );
 CVAR_DEFINE_AUTO( cl_timeout, "60", 0, "connect timeout (in-seconds)" );
-CVAR_DEFINE_AUTO( cl_nopred, "0", FCVAR_ARCHIVE|FCVAR_USERINFO, "disable client movement prediction" );
+CVAR_DEFINE_AUTO( cl_nopred, "0", FCVAR_USERINFO, "disable client movement prediction" );
 static CVAR_DEFINE_AUTO( cl_nodelta, "0", 0, "disable delta-compression for server messages" );
 CVAR_DEFINE( cl_crosshair, "crosshair", "1", FCVAR_ARCHIVE, "show weapon chrosshair" );
 static CVAR_DEFINE_AUTO( cl_cmdbackup, "10", FCVAR_ARCHIVE, "how many additional history commands are sent" );
 CVAR_DEFINE_AUTO( cl_showerror, "0", FCVAR_ARCHIVE, "show prediction error" );
-CVAR_DEFINE_AUTO( cl_bmodelinterp, "1", FCVAR_ARCHIVE, "enable bmodel interpolation" );
+CVAR_DEFINE_AUTO( cl_bmodelinterp, "1", 0, "enable bmodel interpolation" );
 static CVAR_DEFINE_AUTO( cl_lightstyle_lerping, "0", FCVAR_ARCHIVE, "enables animated light lerping (perfomance option)" );
 CVAR_DEFINE_AUTO( cl_idealpitchscale, "0.8", 0, "how much to look up/down slopes and stairs when not using freelook" );
-CVAR_DEFINE_AUTO( cl_nosmooth, "0", FCVAR_ARCHIVE, "disable smooth up stair climbing" );
-CVAR_DEFINE_AUTO( cl_smoothtime, "0.1", FCVAR_ARCHIVE, "time to smooth up" );
-CVAR_DEFINE_AUTO( cl_clockreset, "0.1", FCVAR_ARCHIVE, "frametime delta maximum value before reset" );
-static CVAR_DEFINE_AUTO( cl_fixtimerate, "7.5", FCVAR_ARCHIVE, "time in msec to client clock adjusting" );
+CVAR_DEFINE_AUTO( cl_nosmooth, "0", 0, "disable smooth up stair climbing" );
+CVAR_DEFINE_AUTO( cl_smoothtime, "0.1", 0, "time to smooth up" );
+CVAR_DEFINE_AUTO( cl_clockreset, "0.1", 0, "frametime delta maximum value before reset" );
+static CVAR_DEFINE_AUTO( cl_fixtimerate, "7.5", 0, "time in msec to client clock adjusting" );
 CVAR_DEFINE_AUTO( hud_fontscale, "1.0", FCVAR_ARCHIVE|FCVAR_LATCH, "scale hud font texture" );
 CVAR_DEFINE_AUTO( hud_fontrender, "0", FCVAR_ARCHIVE, "hud font render mode (0: additive, 1: holes, 2: trans)" );
 CVAR_DEFINE_AUTO( hud_scale, "0", FCVAR_ARCHIVE|FCVAR_LATCH, "scale hud at current resolution" );
@@ -94,7 +96,7 @@ static CVAR_DEFINE_AUTO( topcolor, "0", FCVAR_USERINFO|FCVAR_ARCHIVE|FCVAR_FILTE
 static CVAR_DEFINE_AUTO( bottomcolor, "0", FCVAR_USERINFO|FCVAR_ARCHIVE|FCVAR_FILTERABLE, "player bottom color" );
 CVAR_DEFINE_AUTO( rate, "25000", FCVAR_USERINFO|FCVAR_ARCHIVE|FCVAR_FILTERABLE, "player network rate" );
 
-CVAR_DEFINE_AUTO( cl_ticket_generator, "revemu2013", FCVAR_ARCHIVE, "you wouldn't steal a car" );
+CVAR_DEFINE_AUTO( cl_ticket_generator, "revemu2013", FCVAR_ARCHIVE|FCVAR_PRIVILEGED, "you wouldn't steal a car" );
 static CVAR_DEFINE_AUTO( cl_advertise_engine_in_name, "1", FCVAR_ARCHIVE|FCVAR_PRIVILEGED, "add [Xash3D] to the nickname when connecting to GoldSrc servers" );
 static CVAR_DEFINE_AUTO( cl_log_outofband, "0", FCVAR_ARCHIVE, "log out of band messages, can be useful for server admins and for engine debugging" );
 static CVAR_DEFINE_AUTO( cl_autorecord, "0", 0, "automatically start recording a demo after joining the server" );
@@ -195,6 +197,120 @@ void CL_SetCheatState( qboolean multiplayer, qboolean allow_cheats )
 	}
 }
 
+static resource_t *CL_AddResource( resourcetype_t type, const char *name, int size, qboolean bFatalIfMissing, int index )
+{
+	resource_t	*r = &cl.resourcelist[cl.num_resources];
+
+	if( cl.num_resources >= MAX_RESOURCES )
+		Host_Error( "Too many resources on client\n" );
+	cl.num_resources++;
+
+	Q_strncpy( r->szFileName, name, sizeof( r->szFileName ));
+	r->ucFlags |= bFatalIfMissing ? RES_FATALIFMISSING : 0;
+	r->nDownloadSize = size;
+	r->nIndex = index;
+	r->type = type;
+
+	return r;
+}
+
+static void CL_CreateResourceList( void )
+{
+	char szFileName[MAX_OSPATH];
+	byte rgucMD5_hash[16] = { 0 };
+
+	HPAK_FlushHostQueue();
+	cl.num_resources = 0;
+	memset( rgucMD5_hash, 0, sizeof( rgucMD5_hash ));
+
+	ClearBits( cl_logoupdate.flags, FCVAR_CHANGED );
+#if 1 // FIXME: deprecated, remove later
+	ClearBits( cl_logofile.flags, FCVAR_CHANGED );
+	ClearBits( cl_logocolor.flags, FCVAR_CHANGED );
+	ClearBits( cl_logoext.flags, FCVAR_CHANGED );
+#endif
+
+	// sanitize cvar value
+	if( Q_strcmp( cl_logoext.string, "bmp" ) && Q_strcmp( cl_logoext.string, "png" ))
+		Cvar_DirectSet( &cl_logoext, "bmp" );
+
+	Q_snprintf( szFileName, sizeof( szFileName ), "logos/remapped.%s", cl_logoext.string );
+	if( cls.legacymode == PROTO_GOLDSRC )
+	{
+		CL_ConvertImageToWAD3( szFileName );
+		Q_strncpy( szFileName, "tempdecal.wad", sizeof( szFileName ));
+	}
+	file_t		*fp = FS_Open( szFileName, "rb", true );
+
+	if( !fp )
+		return;
+
+	int		nSize = FS_FileLength( fp );
+
+	if( nSize != 0 )
+	{
+		resource_t	*pNewResource = CL_AddResource( t_decal, szFileName, nSize, false, 0 );
+
+		if( pNewResource )
+		{
+			MD5_HashFile( rgucMD5_hash, szFileName, NULL );
+			SetBits( pNewResource->ucFlags, RES_CUSTOM );
+			memcpy( pNewResource->rgucMD5_hash, rgucMD5_hash, 16 );
+			HPAK_AddLump( false, hpk_custom_file.string, pNewResource, NULL, fp );
+		}
+	}
+
+	FS_Close( fp );
+}
+
+/*
+==================
+CL_UpdateLogo
+
+repackage the clan logo and upload it to the server
+==================
+*/
+static void CL_UpdateLogo( void )
+{
+	if( cls.state != ca_active )
+		return;
+
+	CL_CreateResourceList();
+
+	if( cl.num_resources == 0 )
+		return;
+
+	player_info_t	*player = &cl.players[cl.playernum];
+	COM_ClearCustomizationList( &player->customdata, true );
+
+	for( int i = 0; i < cl.num_resources; i++ )
+	{
+		resource_t *pResource = &cl.resourcelist[i];
+
+		if( !COM_CreateCustomization( &player->customdata, pResource, cl.playernum, 0, NULL, NULL ))
+			Con_Printf( "Unable to create custom decal\n" );
+	}
+
+	CL_SendResourceList( cl.resourcelist, cl.num_resources );
+}
+
+static void CL_CheckLogoChanged( void )
+{
+	if( FBitSet( cl_logoupdate.flags, FCVAR_CHANGED ))
+	{
+		CL_UpdateLogo();
+		return;
+	}
+
+#if 1 // FIXME: deprecated, remove later
+	if( FBitSet( cl_logofile.flags | cl_logocolor.flags | cl_logoext.flags, FCVAR_CHANGED ))
+	{
+		CL_UpdateLogo();
+		return;
+	}
+#endif
+}
+
 /*
 ===============
 CL_CheckClientState
@@ -212,6 +328,8 @@ static void CL_CheckClientState( void )
 		cls.changelevel = false;		// changelevel is done
 		cls.changedemo = false;		// changedemo is done
 		cl.first_frame = true;		// first rendering frame
+
+		CL_UpdateLogo();
 
 		SCR_MakeLevelShot();		// make levelshot if needs
 		Cvar_SetValue( "scr_loading", 0.0f );	// reset progress bar
@@ -1135,6 +1253,7 @@ static void CL_SendConnectPacket( connprotocol_t proto, int challenge )
 	}
 
 	cls.broker_wait = false;
+	cls.netchan_pending_cookie = 0;
 
 	if( proto == PROTO_GOLDSRC )
 	{
@@ -1156,7 +1275,7 @@ static void CL_SendConnectPacket( connprotocol_t proto, int challenge )
 	else
 	{
 		const char *qport = Cvar_VariableString( "net_qport" );
-		int extensions = adrtype == NA_LOOPBACK ? 0 : NET_EXT_SPLITSIZE;
+		int extensions = adrtype == NA_LOOPBACK ? 0 : ( NET_EXT_SPLITSIZE | NET_EXT_NETCHAN_COOKIE );
 		string key;
 
 		ID_GetMD5ForAddress( key, adr, sizeof( key ));
@@ -1170,6 +1289,16 @@ static void CL_SendConnectPacket( connprotocol_t proto, int challenge )
 		Info_SetValueForKey( protinfo, "uuid", key, sizeof( protinfo ));
 		Info_SetValueForKey( protinfo, "qport", qport, sizeof( protinfo ));
 		Info_SetValueForKeyf( protinfo, "ext", sizeof( protinfo ), "%d", extensions );
+
+		if( FBitSet( extensions, NET_EXT_NETCHAN_COOKIE ))
+		{
+			uint64_t a = COM_RandomLong( 0, 0xFFFF );
+			uint64_t b = COM_RandomLong( 0, 0xFFFF );
+			uint64_t c = COM_RandomLong( 0, 0xFFFF );
+			uint64_t d = COM_RandomLong( 0, 0xFFFF );
+			cls.netchan_pending_cookie = ( a << 48 ) | ( b << 32 ) | ( c << 16 ) | d;
+			Info_SetValueForKeyf( protinfo, "cookie", sizeof( protinfo ), "%016"PRIx64, cls.netchan_pending_cookie );
+		}
 
 		Netchan_OutOfBandPrint( NS_CLIENT, adr, C2S_CONNECT" %i %i \"%s\" \"%s\"\n", PROTOCOL_VERSION, challenge, protinfo, cls.userinfo );
 		Con_Printf( "Trying to connect with modern protocol\n" );
@@ -1236,13 +1365,7 @@ static void CL_CheckForResend( void )
 	netadr_t adr;
 
 	if( cls.internetservers_wait )
-	{
-		cls.internetservers_wait = NET_MasterQuery(
-			cls.internetservers_key,
-			cls.internetservers_nat,
-			cls.internetservers_customfilter
-		);
-	}
+		cls.internetservers_wait = NET_MasterQuery( 1, cls.internetservers_nat, cls.internetservers_customfilter );
 
 	// if the local server is running and we aren't then connect
 	if( cls.state == ca_disconnected && SV_Active( ))
@@ -1335,102 +1458,6 @@ static void CL_CheckForResend( void )
 		Con_Printf( "Connecting to %s... (retry #%i)\n", cls.servername, cls.connect_retry );
 		CL_SendGetChallenge( adr );
 	}
-}
-
-static resource_t *CL_AddResource( resourcetype_t type, const char *name, int size, qboolean bFatalIfMissing, int index )
-{
-	resource_t	*r = &cl.resourcelist[cl.num_resources];
-
-	if( cl.num_resources >= MAX_RESOURCES )
-		Host_Error( "Too many resources on client\n" );
-	cl.num_resources++;
-
-	Q_strncpy( r->szFileName, name, sizeof( r->szFileName ));
-	r->ucFlags |= bFatalIfMissing ? RES_FATALIFMISSING : 0;
-	r->nDownloadSize = size;
-	r->nIndex = index;
-	r->type = type;
-
-	return r;
-}
-
-static void CL_CreateResourceList( void )
-{
-	char szFileName[MAX_OSPATH];
-	byte rgucMD5_hash[16] = { 0 };
-
-	HPAK_FlushHostQueue();
-	cl.num_resources = 0;
-	memset( rgucMD5_hash, 0, sizeof( rgucMD5_hash ));
-
-	ClearBits( cl_logofile.flags, FCVAR_CHANGED );
-	ClearBits( cl_logocolor.flags, FCVAR_CHANGED );
-	ClearBits( cl_logoext.flags, FCVAR_CHANGED );
-
-	// sanitize cvar value
-	if( Q_strcmp( cl_logoext.string, "bmp" ) && Q_strcmp( cl_logoext.string, "png" ))
-		Cvar_DirectSet( &cl_logoext, "bmp" );
-
-	Q_snprintf( szFileName, sizeof( szFileName ), "logos/remapped.%s", cl_logoext.string );
-	if( cls.legacymode == PROTO_GOLDSRC )
-	{
-		CL_ConvertImageToWAD3( szFileName );
-		Q_strncpy( szFileName, "tempdecal.wad", sizeof( szFileName ));
-	}
-	file_t		*fp = FS_Open( szFileName, "rb", true );
-
-	if( !fp )
-		return;
-
-	int		nSize = FS_FileLength( fp );
-
-	if( nSize != 0 )
-	{
-		resource_t	*pNewResource = CL_AddResource( t_decal, szFileName, nSize, false, 0 );
-
-		if( pNewResource )
-		{
-			MD5_HashFile( rgucMD5_hash, szFileName, NULL );
-			SetBits( pNewResource->ucFlags, RES_CUSTOM );
-			memcpy( pNewResource->rgucMD5_hash, rgucMD5_hash, 16 );
-			HPAK_AddLump( false, hpk_custom_file.string, pNewResource, NULL, fp );
-		}
-	}
-
-	FS_Close( fp );
-}
-
-/*
-==================
-CL_CheckLogoChanged
-
-==================
-*/
-static void CL_CheckLogoChanged( void )
-{
-	if( cls.state != ca_active )
-		return;
-
-	if( !FBitSet( cl_logofile.flags | cl_logocolor.flags | cl_logoext.flags, FCVAR_CHANGED ))
-		return;
-
-	CL_CreateResourceList();
-
-	if( cl.num_resources == 0 )
-		return;
-
-	player_info_t	*player = &cl.players[cl.playernum];
-	COM_ClearCustomizationList( &player->customdata, true );
-
-	for( int i = 0; i < cl.num_resources; i++ )
-	{
-		resource_t *pResource = &cl.resourcelist[i];
-
-		if( !COM_CreateCustomization( &player->customdata, pResource, cl.playernum, 0, NULL, NULL ))
-			Con_Printf( "Unable to create custom decal\n" );
-	}
-
-	CL_SendResourceList( cl.resourcelist, cl.num_resources );
 }
 
 static qboolean CL_StringToProtocol( const char *s, connprotocol_t *proto )
@@ -1664,10 +1691,19 @@ void CL_SetupNetchanForProtocol( connprotocol_t proto )
 
 		if( FBitSet( cls.extensions, NET_EXT_SPLITSIZE ))
 			Con_Reportf( "^2NET_EXT_SPLITSIZE enabled^7 (packet size is %d)\n", (int)cl_dlmax.value );
+
+		if( FBitSet( cls.extensions, NET_EXT_NETCHAN_COOKIE ))
+		{
+			Con_Reportf( "^2NET_EXT_NETCHAN_COOKIE enabled^7\n" );
+			SetBits( flags, NETCHAN_USE_COOKIE );
+		}
 		break;
 	}
 
 	Netchan_Setup( NS_CLIENT, &cls.netchan, net_from, Cvar_VariableInteger( "net_qport" ), NULL, pfnBlockSize, flags );
+
+	if( FBitSet( flags, NETCHAN_USE_COOKIE ))
+		Netchan_SetCookie( &cls.netchan, cls.netchan_pending_cookie );
 }
 
 /*
@@ -1822,27 +1858,10 @@ static void CL_InternetServers_f( void )
 
 	cls.internetservers_nat = cl_nat.value != 0.0f;
 	cls.internetservers_pending = true;
-	cls.internetservers_key = COM_RandomLong( 0, 0xFFFFFFFF );
 	Q_strncpy( cls.internetservers_customfilter, Cmd_Argv( 1 ), sizeof( cls.internetservers_customfilter ));
 
-	cls.internetservers_wait = NET_MasterQuery(
-		cls.internetservers_key,
-		cls.internetservers_nat,
-		cls.internetservers_customfilter
-	);
-}
-
-static void CL_QueryServer( netadr_t adr, connprotocol_t proto )
-{
-	switch( proto )
-	{
-	case PROTO_GOLDSRC:
-		Netchan_OutOfBand( NS_CLIENT, adr, sizeof( A2S_GOLDSRC_INFO ), A2S_GOLDSRC_INFO ); // includes null terminator!
-		break;
-	case PROTO_CURRENT:
-		Netchan_OutOfBandPrint( NS_CLIENT, adr, A2A_INFO" %i", PROTOCOL_VERSION );
-		break;
-	}
+	// the key is dead extension, keep for compatibility until we use UDP based master server protocol
+	cls.internetservers_wait = NET_MasterQuery( 1, cls.internetservers_nat, cls.internetservers_customfilter );
 }
 
 static void CL_QueryServer_f( void )
@@ -1870,7 +1889,7 @@ static void CL_QueryServer_f( void )
 	if( !CL_StringToProtocol( Cmd_Argv( 2 ), &proto ))
 		return;
 
-	CL_QueryServer( adr, proto );
+	NET_QueryServerByAddress( adr, proto );
 }
 
 /*
@@ -2053,7 +2072,7 @@ static void CL_ParseStatusMessage( netadr_t from, sizebuf_t *msg )
 	UI_AddServerToList( from, infostring );
 }
 
-static void CL_ParseGoldSrcStatusMessage( netadr_t from, sizebuf_t *msg )
+static void CL_ParseGoldSrcStatusMessage( netadr_t from, sizebuf_t *msg, qboolean legacy_format )
 {
 	static char	s[512+8];
 	int p, numcl, maxcl, password, remaining, bots;
@@ -2063,19 +2082,58 @@ static void CL_ParseGoldSrcStatusMessage( netadr_t from, sizebuf_t *msg )
 	// set to beginning but skip header
 	MSG_SeekToBit( msg, (sizeof( uint32_t ) + sizeof( uint8_t )) << 3, SEEK_SET );
 
-	p = MSG_ReadByte( msg );
-	Q_strncpy( host, MSG_ReadString( msg ), sizeof( host ));
-	Q_strncpy( map, MSG_ReadString( msg ), sizeof( map ));
-	Q_strncpy( gamedir, MSG_ReadString( msg ), sizeof( gamedir ));
-	MSG_ReadString( msg ); // game description
-	MSG_ReadShort( msg ); // app id
-	numcl = MSG_ReadByte( msg );
-	maxcl = MSG_ReadByte( msg );
-	bots = MSG_ReadByte( msg ); // bots count
-	MSG_ReadByte( msg ); // dedicated
-	MSG_ReadByte( msg ); // operating system
-	password = MSG_ReadByte( msg );
-	Q_strncpy( version, MSG_ReadString( msg ), sizeof( version ));
+	if( legacy_format )
+	{
+		string address;
+		int mod;
+
+		p = MSG_ReadByte( msg );
+		Q_strncpy( address, MSG_ReadString( msg ), sizeof( address ));
+		Q_strncpy( host, MSG_ReadString( msg ), sizeof( host ));
+		Q_strncpy( map, MSG_ReadString( msg ), sizeof( map ));
+		Q_strncpy( gamedir, MSG_ReadString( msg ), sizeof( gamedir ));
+		MSG_ReadString( msg ); // game description
+		numcl = MSG_ReadByte( msg );
+		maxcl = MSG_ReadByte( msg );
+		MSG_ReadByte( msg ); // protocol version
+		MSG_ReadByte( msg ); // server type
+		MSG_ReadByte( msg ); // operating system
+		password = MSG_ReadByte( msg );
+		mod = MSG_ReadByte( msg ); // mod flag
+
+		if( mod == 1 )
+		{
+			MSG_ReadString( msg ); // mod URL
+			MSG_ReadString( msg ); // mod download URL
+			MSG_ReadLong( msg );   // mod version
+			MSG_ReadLong( msg );   // mod size
+			MSG_ReadByte( msg );   // mod type (SP/MP)
+			MSG_ReadByte( msg );   // custom DLL flag
+			Q_strncpy( version, MSG_ReadString( msg ), sizeof( version ));
+			bots = MSG_ReadByte( msg ); // bots count
+		}
+		else
+		{
+			Q_strncpy( version, MSG_ReadString( msg ), sizeof( version ));
+			bots = MSG_ReadByte( msg ); // bots count
+		}
+	}
+	else
+	{
+		p = MSG_ReadByte( msg );
+		Q_strncpy( host, MSG_ReadString( msg ), sizeof( host ));
+		Q_strncpy( map, MSG_ReadString( msg ), sizeof( map ));
+		Q_strncpy( gamedir, MSG_ReadString( msg ), sizeof( gamedir ));
+		MSG_ReadString( msg ); // game description
+		MSG_ReadShort( msg ); // app id
+		numcl = MSG_ReadByte( msg );
+		maxcl = MSG_ReadByte( msg );
+		bots = MSG_ReadByte( msg ); // bots count
+		MSG_ReadByte( msg ); // server type
+		MSG_ReadByte( msg ); // operating system
+		password = MSG_ReadByte( msg );
+		Q_strncpy( version, MSG_ReadString( msg ), sizeof( version ));
+	}
 
 	// sanity check
 	if( maxcl > MAX_CLIENTS || numcl > MAX_CLIENTS || bots > MAX_CLIENTS || numcl > maxcl || bots > maxcl )
@@ -2385,6 +2443,39 @@ static void CL_ClientConnect( connprotocol_t proto, const char *c, netadr_t from
 			return;
 		}
 
+		if( cls.netchan_pending_cookie != 0 )
+		{
+			int server_extensions = Q_atoi( Info_ValueForKey( Cmd_Argv( 1 ), "ext" ));
+
+			if( FBitSet( server_extensions, NET_EXT_NETCHAN_COOKIE ))
+			{
+				const char *cookie_str = Info_ValueForKey( Cmd_Argv( 1 ), "cookie" );
+
+				if( Q_strlen( cookie_str ) != 16 )
+				{
+					Con_Reportf( S_WARN "%s: missing cookie echo from %s, ignoring (possible spoof)\n", __func__, NET_AdrToString( from ));
+					return;
+				}
+
+				byte buf[8];
+				COM_HexConvert( cookie_str, 16, buf );
+
+				uint64_t echoed = 0;
+				for( int i = 0; i < 8; i++ )
+					echoed = ( echoed << 8 ) | buf[i];
+
+				if( echoed != cls.netchan_pending_cookie )
+				{
+					Con_Reportf( S_WARN "%s: invalid cookie echo from %s, ignoring (possible spoof)\n", __func__, NET_AdrToString( from ));
+					return;
+				}
+			}
+			else
+			{
+				cls.netchan_pending_cookie = 0;
+			}
+		}
+
 		cls.build_num = 0; // not used in Xash3D protocols
 		cls.allow_cheats = Q_atoi( Info_ValueForKey( Cmd_Argv( 1 ), "cheats" ));
 	}
@@ -2503,6 +2594,21 @@ static void CL_Reject( const char *c, const char *args, netadr_t from )
 	CL_Disconnect_f();
 }
 
+/*
+=================
+CL_NotifyServerListResponse
+
+=================
+*/
+void CL_NotifyServerListResponse( void )
+{
+	if( !cls.internetservers_pending )
+		return;
+
+	UI_ResetPing();
+	cls.internetservers_pending = false;
+}
+
 static void CL_ServerList( netadr_t from, sizebuf_t *msg )
 {
 	connprotocol_t proto;
@@ -2513,25 +2619,13 @@ static void CL_ServerList( netadr_t from, sizebuf_t *msg )
 		return;
 	}
 
-	// check the extra header
 	if( proto == PROTO_CURRENT )
 	{
+		// dead extension
 		if( MSG_ReadByte( msg ) == 0x7f )
 		{
-			uint32_t key = MSG_ReadDword( msg );
-
-			if( cls.internetservers_key != key )
-			{
-				Con_Printf( S_WARN "unexpected server list packet from %s (invalid key)\n", NET_AdrToString( from ));
-			return;
-			}
-
-			MSG_ReadByte( msg ); // reserved byte
-		}
-		else
-		{
-			Con_Printf( S_WARN "invalid server list packet from %s (missing extra header)\n", NET_AdrToString( from ));
-			return;
+			MSG_ReadDword( msg ); // was key
+			MSG_ReadByte( msg );  // was reserved
 		}
 	}
 
@@ -2552,6 +2646,7 @@ static void CL_ServerList( netadr_t from, sizebuf_t *msg )
 			MSG_ReadBytes( msg, servadr.ip, sizeof( servadr.ip ), sizeof( servadr.ip ));	// 4 bytes for IP
 			NET_NetadrSetType( &servadr, NA_IP );
 		}
+
 		MSG_ReadBytes( msg, &servadr.port, sizeof( servadr.port ), sizeof( servadr.port ));	// 2 bytes for Port, in network byte order
 
 		// list is ends here
@@ -2559,14 +2654,10 @@ static void CL_ServerList( netadr_t from, sizebuf_t *msg )
 			break;
 
 		NET_Config( true, false ); // allow remote
-		CL_QueryServer( servadr, proto );
+		NET_QueryServerByAddress( servadr, proto );
 	}
 
-	if( cls.internetservers_pending )
-	{
-		UI_ResetPing();
-		cls.internetservers_pending = false;
-	}
+	CL_NotifyServerListResponse();
 }
 
 /*
@@ -2603,7 +2694,11 @@ static void CL_ConnectionlessPacket( netadr_t from, sizebuf_t *msg )
 	}
 	else if( c[0] == S2A_GOLDSRC_INFO )
 	{
-		CL_ParseGoldSrcStatusMessage( from, msg );
+		CL_ParseGoldSrcStatusMessage( from, msg, false );
+	}
+	else if( c[0] == S2A_GOLDSRC_LEGACY_INFO )
+	{
+		CL_ParseGoldSrcStatusMessage( from, msg, true );
 	}
 	else if( !Q_strcmp( c, A2A_NETINFO ))
 	{
@@ -3397,6 +3492,7 @@ static void CL_InitLocal( void )
 	Cvar_RegisterVariable( &cl_logofile );
 	Cvar_RegisterVariable( &cl_logocolor );
 	Cvar_RegisterVariable( &cl_logoext );
+	Cvar_RegisterVariable( &cl_logoupdate );
 	Cvar_RegisterVariable( &cl_logomaxdim );
 	Cvar_RegisterVariable( &cl_test_bandwidth );
 

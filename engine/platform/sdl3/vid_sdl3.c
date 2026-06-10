@@ -322,6 +322,7 @@ qboolean R_Init_Video( ref_graphic_apis_t type )
 
 void R_Free_Video( void )
 {
+	SDL_GL_MakeCurrent( host.hWnd, NULL );
 	SDL_GL_DestroyContext( glw_state.context );
 	glw_state.context = NULL;
 

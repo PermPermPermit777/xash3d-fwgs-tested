@@ -375,7 +375,7 @@ static qboolean GL_DeleteContext( void )
 {
 	if( glw_state.context )
 	{
-		SDL_GL_MakeCurrent( host.hWnd, NULL );
+		SDL_GL_MakeCurrent( NULL, NULL );
 		SDL_GL_DeleteContext( glw_state.context );
 		glw_state.context = NULL;
 	}
